@@ -120,6 +120,7 @@ class Config(collections.namedtuple(
         "checkpoint_freq",
         "actors",
         "evaluators",
+        "inference_batch_size",
         "evaluation_window",
         "eval_levels",
 
@@ -140,18 +141,6 @@ class Config(collections.namedtuple(
     ])):
   """A config for the model/experiment."""
   pass
-
-
-def _init_model_from_config(config):
-  return model_lib.Model.build_model(
-      config.nn_model,
-      config.observation_shape,
-      config.output_size,
-      config.nn_width,
-      config.nn_depth,
-      config.weight_decay,
-      config.learning_rate,
-      config.path)
 
 
 def watcher(fn):
@@ -231,7 +220,7 @@ def _play_game(logger, game_num, game, bots, temperature, temperature_drop):
   return trajectory
 
 
-def update_checkpoint(logger, queue, model, az_evaluator):
+def update_checkpoint(logger, queue, az_evaluator):
   """Read the queue for a checkpoint to load, or an exit signal."""
   path = None
   while True:  # Get the last message, ignore intermediate ones.
@@ -240,45 +229,38 @@ def update_checkpoint(logger, queue, model, az_evaluator):
     except spawn.Empty:
       break
   if path:
-    logger.print("Inference cache:", az_evaluator.cache_info())
-    logger.print("Loading checkpoint", path)
-    model.load_checkpoint(path)
-    az_evaluator.clear_cache()
+    az_evaluator.load_model_checkpoint(path)
   elif path is not None:  # Empty string means stop this process.
     return False
   return True
 
 
 @watcher
-def actor(*, config, game, logger, queue):
+def actor(*, config, game, inference_queue, logger, queue):
   """An actor process runner that generates games and returns trajectories."""
-  logger.print("Initializing model")
-  model = _init_model_from_config(config)
   logger.print("Initializing bots")
-  az_evaluator = evaluator_lib.AlphaZeroEvaluator(game, model)
+  az_evaluator = evaluator_lib.AlphaZeroEvaluator(config, inference_queue)
   bots = [
       _init_bot(config, game, az_evaluator, False),
       _init_bot(config, game, az_evaluator, False),
   ]
   for game_num in itertools.count():
-    if not update_checkpoint(logger, queue, model, az_evaluator):
+    if not update_checkpoint(logger, queue, az_evaluator):
       return
     queue.put(_play_game(logger, game_num, game, bots, config.temperature,
                          config.temperature_drop))
 
 
 @watcher
-def evaluator(*, game, config, logger, queue):
+def evaluator(*, config, game, inference_queue, logger, queue):
   """A process that plays the latest checkpoint vs standard MCTS."""
   results = Buffer(config.evaluation_window)
-  logger.print("Initializing model")
-  model = _init_model_from_config(config)
   logger.print("Initializing bots")
-  az_evaluator = evaluator_lib.AlphaZeroEvaluator(game, model)
+  az_evaluator = evaluator_lib.AlphaZeroEvaluator(config, inference_queue)
   random_evaluator = mcts.RandomRolloutEvaluator()
 
   for game_num in itertools.count():
-    if not update_checkpoint(logger, queue, model, az_evaluator):
+    if not update_checkpoint(logger, queue, az_evaluator):
       return
 
     az_player = game_num % 2
@@ -315,7 +297,7 @@ def learner(*, game, config, actors, evaluators, broadcast_fn, logger):
   replay_buffer = Buffer(config.replay_buffer_size)
   learn_rate = config.replay_buffer_size // config.replay_buffer_reuse
   logger.print("Initializing model")
-  model = _init_model_from_config(config)
+  model = model_lib.init_model_from_config(config)
   logger.print("Model type: %s(%s, %s)" % (config.nn_model, config.nn_width,
                                            config.nn_depth))
   logger.print("Model size:", model.num_trainable_variables, "variables")
@@ -517,15 +499,26 @@ def alpha_zero(config: Config):
   with open(os.path.join(config.path, "config.json"), "w") as fp:
     fp.write(json.dumps(config._asdict(), indent=2, sort_keys=True) + "\n")
 
-  actors = [spawn.Process(actor, kwargs={"game": game, "config": config,
-                                         "num": i})
-            for i in range(config.actors)]
-  evaluators = [spawn.Process(evaluator, kwargs={"game": game, "config": config,
-                                                 "num": i})
-                for i in range(config.evaluators)]
+  if config.inference_batch_size > 0:
+    proc = spawn.Process(evaluator_lib.batch_inference_runner,
+                         kwargs={"config": config})
+    inference_procs = [proc]
+    inference_queue = proc.queue
+  else:
+    inference_procs = []
+    inference_queue = None
+
+  actors = [spawn.Process(actor, kwargs={
+    "game": game, "config": config, "num": i,
+    "inference_queue": inference_queue,
+    }) for i in range(config.actors)]
+  evaluators = [spawn.Process(evaluator, kwargs={
+    "game": game, "config": config, "num": i,
+    "inference_queue": inference_queue,
+    }) for i in range(config.evaluators)]
 
   def broadcast(msg):
-    for proc in actors + evaluators:
+    for proc in actors + evaluators + inference_procs:
       proc.queue.put(msg)
 
   try:
@@ -535,5 +528,5 @@ def alpha_zero(config: Config):
     print("Caught a KeyboardInterrupt, stopping early.")
   finally:
     broadcast("")
-    for proc in actors + evaluators:
+    for proc in actors + evaluators + inference_procs:
       proc.join()

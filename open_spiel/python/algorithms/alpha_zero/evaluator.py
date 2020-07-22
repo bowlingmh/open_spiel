@@ -33,25 +33,64 @@ import numpy as np
 from open_spiel.python.algorithms import mcts
 import pyspiel
 from open_spiel.python.utils import lru_cache
+from open_spiel.python.utils import spawn
+from open_spiel.python.algorithms.alpha_zero import model as model_lib
+from multiprocessing import Pipe
 
+def batch_inference_runner(*, config, queue):
+  batch_size = config.inference_batch_size
+  assert batch_size > 0
+
+  model = model_lib.init_model_from_config(config)
+
+  conns = []
+  batch = []
+
+  while True:
+    msg = queue.get()
+
+    if not msg: # Empty message ends the process
+      return
+    elif type(msg) == str: # Load a new model checkpoint
+      model.load_checkpoint(msg)
+    else: # Pipe containing an query for inference
+      conn = msg
+      query = conn.recv()
+
+      conns.append(conn)
+      batch.append(query)
+
+    # Process a batch
+    if len(conns) >= batch_size:
+      obs = np.stack(b[0] for b in batch)
+      mask = np.stack(b[1] for b in batch)
+
+      value, policy = model.inference(obs, mask)
+
+      for i,conn in enumerate(conns):
+        conn.send((value[i,0], policy[i]))
+
+      conns = []
+      batch = []
+      
 
 class AlphaZeroEvaluator(mcts.Evaluator):
   """An AlphaZero MCTS Evaluator."""
 
-  def __init__(self, game, model, cache_size=2**16):
+  def __init__(self, config,
+               inference_queue=None,
+               logger=None,
+               cache_size=2**16):
     """An AlphaZero MCTS Evaluator."""
-    if game.num_players() != 2:
-      raise ValueError("Game must be for two players.")
-    game_type = game.get_type()
-    if game_type.reward_model != pyspiel.GameType.RewardModel.TERMINAL:
-      raise ValueError("Game must have terminal rewards.")
-    if game_type.dynamics != pyspiel.GameType.Dynamics.SEQUENTIAL:
-      raise ValueError("Game must have sequential turns.")
-    if game_type.chance_mode != pyspiel.GameType.ChanceMode.DETERMINISTIC:
-      raise ValueError("Game must be deterministic.")
-
-    self._model = model
+    self._logger = logger
     self._cache = lru_cache.LRUCache(cache_size)
+    self._inference_queue = inference_queue
+
+    if self._inference_queue:
+      self._inference_pipe = Pipe()
+      self._model = None
+    else:
+      self._model = model_lib.init_model_from_config(config)
 
   def cache_info(self):
     return self._cache.info()
@@ -59,18 +98,38 @@ class AlphaZeroEvaluator(mcts.Evaluator):
   def clear_cache(self):
     self._cache.clear()
 
+  def load_model_checkpoint(self, path):
+    if self._logger:
+      self._logger.print("Inference cache:", self.cache_info())
+      self._logger.print("Loading checkpoint", path)
+
+    if self._model:
+      self._model.load_checkpoint(path)
+
+    self.clear_cache()
+
   def _inference(self, state):
-    # Make a singleton batch
-    obs = np.expand_dims(state.observation_tensor(), 0)
-    mask = np.expand_dims(state.legal_actions_mask(), 0)
+    obs = np.array(state.observation_tensor())
+    mask = np.array(state.legal_actions_mask())
 
     # ndarray isn't hashable
     cache_key = obs.tobytes() + mask.tobytes()
 
-    value, policy = self._cache.make(
-        cache_key, lambda: self._model.inference(obs, mask))
+    rv = self._cache.get(cache_key)
+    if rv: return rv
 
-    return value[0, 0], policy[0]  # Unpack batch
+    if self._model:
+      value, policy = self._model.inference(np.expand_dims(obs, 0),
+                                            np.expand_dims(mask, 0))
+      rv = value[0, 0], policy[0]  # Unpack batch
+    else:
+      # Put the query into the batching queue and wait for response
+      self._inference_queue.put(self._inference_pipe[1])
+      self._inference_pipe[0].send((obs, mask))
+      rv = self._inference_pipe[0].recv()
+
+    self._cache.set(cache_key, rv)
+    return rv
 
   def evaluate(self, state):
     """Returns a value for the given state."""

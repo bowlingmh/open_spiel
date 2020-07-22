@@ -36,7 +36,6 @@ from typing import Sequence
 import numpy as np
 import tensorflow.compat.v1 as tf
 
-
 def cascade(x, fns):
   for fn in fns:
     x = fn(x)
@@ -368,3 +367,15 @@ class Model(object):
 
   def load_checkpoint(self, path):
     return self._saver.restore(self._session, path)
+
+def init_model_from_config(config):
+  return Model.build_model(
+      config.nn_model,
+      config.observation_shape,
+      config.output_size,
+      config.nn_width,
+      config.nn_depth,
+      config.weight_decay,
+      config.learning_rate,
+      config.path)
+

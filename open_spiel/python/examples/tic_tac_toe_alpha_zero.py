@@ -42,8 +42,9 @@ def main(unused_argv):
       max_steps=25,
       checkpoint_freq=25,
 
-      actors=4,
-      evaluators=4,
+      actors=2,
+      evaluators=2,
+      inference_batch_size=0,
       uct_c=1,
       max_simulations=20,
       policy_alpha=0.25,

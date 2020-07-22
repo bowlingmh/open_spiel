@@ -46,6 +46,7 @@ flags.DEFINE_string("path", None, "Where to save checkpoints.")
 flags.DEFINE_integer("checkpoint_freq", 100, "Save a checkpoint every N steps.")
 flags.DEFINE_integer("actors", 2, "How many actors to run.")
 flags.DEFINE_integer("evaluators", 1, "How many evaluators to run.")
+flags.DEFINE_integer("inference_batch_size", 0, "How many network evals to batch (0=synchronous).")
 flags.DEFINE_integer("evaluation_window", 100,
                      "How many games to average results over.")
 flags.DEFINE_integer(
@@ -74,6 +75,7 @@ def main(unused_argv):
 
       actors=FLAGS.actors,
       evaluators=FLAGS.evaluators,
+      inference_batch_size=FLAGS.inference_batch_size,
       uct_c=FLAGS.uct_c,
       max_simulations=FLAGS.max_simulations,
       policy_alpha=FLAGS.policy_alpha,
